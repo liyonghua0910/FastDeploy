@@ -631,20 +631,42 @@ class PrefixCacheManager:
 
     def request_match_blocks(self, task, block_size, *args):
         """
-        Get match blocks info for a task.
-        This is a synchronous interface. If CPU-to-GPU data transfer occurs,
+        Attempt to match existing cache blocks for a request and prepare GPU caches.
+
+        This synchronous routine tries to match the request's `input_ids` against
+        cached blocks (both GPU and CPU). It returns the set of block IDs that are
+        already on GPU or have just been allocated on GPU to mirror matched CPU
+        cache blocks. It also updates internal metrics and temporary leaf-node
+        mappings; the final leaf will be adjusted later by `update_cache_blocks()`.
+
+        NOTE: This is a synchronous interface. If CPU-to-GPU data transfer occurs,
         it will block until synchronization completes.
         Callers requiring asynchronous behavior should invoke this via a thread pool.
 
-        Note: This function may allocate GPU blocks for matched CPU Cache
+        NOTE: This function may allocate GPU blocks for matched CPU Cache
 
-        Parameters:
-        - task: Task dictionary
-        - block_size: Size per block (in tokens)
+        Parameters
+        ----------
+        task : Task-like
+            Holds `request_id`, `prompt_token_ids`, `output_token_ids`,
+            and other per-request fields used by the cache.
+        block_size : int
+            Token capacity per block; used to compute matched/cached block counts.
+        *args : Any
+            Ignored here; kept for interface compatibility.
 
-        Returns:
-        - common_block_ids: List of matched shared blocks
-        - unique_block_ids: List of exclusively allocated blocks
+        Returns
+        -------
+        common_block_ids : List[int]
+            Block IDs usable on GPU for this request (matched GPU + newly allocated
+            to mirror matched CPU).
+        matched_token_num : int
+            Total number of matched tokens (GPU + CPU) along the prefix.
+        hit_info : Dict[str, int]
+            A small summary with:
+            - "gpu_cache_blocks": matched GPU tokens // block_size
+            - "cpu_cache_blocks": matched CPU tokens // block_size
+
         """
         with self.request_release_lock:
             try:
@@ -652,11 +674,13 @@ class PrefixCacheManager:
                 hit_info["gpu_cache_blocks"] = 0
                 hit_info["cpu_cache_blocks"] = 0
                 self.metrics.req_count += 1
+
                 if isinstance(task.prompt_token_ids, np.ndarray):
                     prompt_token_ids = task.prompt_token_ids.tolist()
                 else:
                     prompt_token_ids = task.prompt_token_ids
                 input_ids = prompt_token_ids + task.output_token_ids
+
                 req_id = task.request_id
                 logger.info(f"request_match_blocks: start to allocate blocks for req_id {req_id}")
                 input_token_num = len(input_ids)
