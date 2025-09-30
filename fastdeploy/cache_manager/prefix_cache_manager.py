@@ -25,6 +25,7 @@ import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
+from typing import Union
 
 import numpy as np
 
@@ -374,9 +375,9 @@ class PrefixCacheManager:
         else:
             return True
 
-    def allocate_gpu_blocks(self, num_blocks):
+    def allocate_gpu_blocks(self, num_blocks: int):
         """
-        allocate gpu blocks.
+        Allocate `num_blocks` gpu blocks.
         """
         assert num_blocks <= len(
             self.gpu_free_block_list
@@ -389,9 +390,9 @@ class PrefixCacheManager:
         main_process_metrics.available_gpu_resource.set(self.available_gpu_resource)
         return allocated_block_ids
 
-    def recycle_gpu_blocks(self, gpu_block_ids):
+    def recycle_gpu_blocks(self, gpu_block_ids: Union[list, int]):
         """
-        recycle gpu blocks.
+        Recycle gpu blocks by block ids.
         """
         logger.info(
             f"recycle_gpu_blocks: {gpu_block_ids}, len(self.gpu_free_block_list) {len(self.gpu_free_block_list)}"
@@ -404,9 +405,9 @@ class PrefixCacheManager:
         main_process_metrics.free_gpu_block_num.set(len(self.gpu_free_block_list))
         main_process_metrics.available_gpu_resource.set(self.available_gpu_resource)
 
-    def allocate_cpu_blocks(self, num_blocks):
+    def allocate_cpu_blocks(self, num_blocks: int):
         """
-        allocate cpu blocks.
+        Allocate `num_blocks` cpu blocks.
         """
         assert num_blocks <= len(
             self.cpu_free_block_list
@@ -417,9 +418,9 @@ class PrefixCacheManager:
         )
         return allocated_block_ids
 
-    def recycle_cpu_blocks(self, cpu_block_ids):
+    def recycle_cpu_blocks(self, cpu_block_ids: Union[list, int]):
         """
-        recycle cpu blocks.
+        Recycle cpu blocks by block ids.
         """
         logger.info(
             f"recycle_cpu_blocks: {cpu_block_ids}, len(self.cpu_free_block_list) {len(self.cpu_free_block_list)}"
@@ -555,60 +556,82 @@ class PrefixCacheManager:
 
         return gpu_recv_block_ids, gpu_extra_block_ids
 
-    def get_required_block_num(self, input_token_num, block_size):
+    def get_required_block_num(self, input_token_num: int, block_size: int):
         """
-        get required block num by input token num and block size
+        Get required block num by input token num and block size,
+        equivalent to ceil(input_token_num / block_size)
         """
         return (input_token_num + block_size - 1) // block_size
 
-    def update_cache_blocks(self, task, block_size, num_computed_tokens):
+    def update_cache_blocks(self, task, block_size: int, num_computed_tokens: int):
         """
-        update cache blocks for a task.
-        # TODO(chengyanfu): support async update
+        Update the radix-tree/cache state for a request based on how many tokens
+        have been computed so far.
+        TODO(chengyanfu): support async update
 
-        Parameters:
-        - task: Task
-        - block_size: Size per block (in tokens)
+        Parameters
+        ----------
+        task : Task
+            Holds request metadata and token sequences (prompt/output) as well as
+            GPU block table for this request.
+        block_size : int
+            Token count per cache block. Only full blocks are committed.
+        num_computed_tokens : int
+            Total tokens (prompt + generated) that have actually been computed
+            for this request at the current moment.
         """
         try:
             req_id = task.request_id
             block_tables = task.block_tables
 
+            # Fetch last known leaf and how many tokens have already been cached
             last_node, num_cached_tokens = self.cache_info[req_id]
+
+            # Normalize prompt tokens to a list
             if isinstance(task.prompt_token_ids, np.ndarray):
                 prompt_token_ids = task.prompt_token_ids.tolist()
             else:
                 prompt_token_ids = task.prompt_token_ids
-            input_ids = prompt_token_ids + task.output_token_ids
-            can_cache_computed_tokens = num_computed_tokens - num_computed_tokens % block_size
-            left_input_ids = input_ids[num_cached_tokens:can_cache_computed_tokens]
-            gpu_extra_block_ids = block_tables[num_cached_tokens // block_size :]
-            if req_id in self.leaf_req_map[last_node]:  # delete old leaf record, update later
+
+            input_ids = prompt_token_ids + task.output_token_ids  # current full sequence (input + output)
+            num_cacheable_tokens = (
+                num_computed_tokens - num_computed_tokens % block_size
+            )  # the nearest full block boundary
+            input_ids_to_be_cached = input_ids[
+                num_cached_tokens:num_cacheable_tokens
+            ]  # newly cacheable token slice since last update
+            block_ids_not_cached = block_tables[num_cached_tokens // block_size :]  # blocks not yet cached
+
+            # Remove request from old leaf; will remap after building the new path
+            if req_id in self.leaf_req_map[last_node]:
                 self.leaf_req_map[last_node].remove(req_id)
 
             with self.request_release_lock:
+                # Extend tree path for the new full blocks (no need to reserve decoding blocks here)
                 current_time = time.time()
                 leaf_node = self.build_path(
                     req_id=req_id,
                     current_time=current_time,
                     input_ids=input_ids,
-                    left_input_ids=left_input_ids,
-                    gpu_block_ids=gpu_extra_block_ids,
+                    left_input_ids=input_ids_to_be_cached,
+                    gpu_block_ids=block_ids_not_cached,
                     block_size=block_size,
                     last_node=last_node,
-                    reverved_dec_block_num=0,
+                    reserved_dec_block_num=0,
                 )
+                # Remap request and leaf node
                 self.req_leaf_map[req_id] = leaf_node
                 self.leaf_req_map[leaf_node].add(req_id)
-                self.cache_info[req_id] = (leaf_node, can_cache_computed_tokens)
-                task.cached_block_num = can_cache_computed_tokens // block_size
+
+                self.cache_info[req_id] = (leaf_node, num_cacheable_tokens)
+                task.cached_block_num = num_cacheable_tokens // block_size
         except Exception as e:
             logger.error(f"update_cache_blocks, error: {type(e)} {e}, {str(traceback.format_exc())}")
             raise e
 
     def request_match_blocks(self, task, block_size, *args):
         """
-        get match blocks info for a task.
+        Get match blocks info for a task.
         This is a synchronous interface. If CPU-to-GPU data transfer occurs,
         it will block until synchronization completes.
         Callers requiring asynchronous behavior should invoke this via a thread pool.
@@ -906,8 +929,8 @@ class PrefixCacheManager:
             del self.node_map[node.node_id]
         logger.info(f"free_block_ids_async: free node {node}")
 
-        self.recycle_gpu_blocks(node.reverved_dec_block_ids)
-        node.reverved_dec_block_ids = []
+        self.recycle_gpu_blocks(node.reserved_dec_block_ids)
+        node.reserved_dec_block_ids = []
         self.recycle_gpu_blocks(node.block_id)
 
     def _handle_free_gpu_node_with_cpu(
@@ -923,8 +946,8 @@ class PrefixCacheManager:
         GPU node eviction in hierarchical cache layers
         """
 
-        self.recycle_gpu_blocks(node.reverved_dec_block_ids)
-        node.reverved_dec_block_ids = []
+        self.recycle_gpu_blocks(node.reserved_dec_block_ids)
+        node.reserved_dec_block_ids = []
 
         need_recycle_gpu_block_ids.append(node.block_id)
         hash_value_gpu_block_ids_map[node.input_hash_value].append(node.block_id)
@@ -1240,80 +1263,107 @@ class PrefixCacheManager:
 
     def build_path(
         self,
-        req_id,
-        current_time,
-        input_ids,
-        left_input_ids,
-        gpu_block_ids,
-        block_size,
-        last_node,
-        reverved_dec_block_num,
+        req_id: str,
+        current_time: float,
+        input_ids: list,
+        left_input_ids: list,
+        gpu_block_ids: list[int],
+        block_size: int,
+        last_node: BlockNode,
+        reserved_dec_block_num: list,
     ):
         """
-        Build path for blocks beyond the common prefix
-            Parameters:
-            - req_id: Request ID of the task
-            - left_input_ids: Remaining input tokens not found in the prefix tree
-            - gpu_block_ids: List of available GPU block IDs for new node allocation
-            - block_size: Token capacity per block
-            - last_node: Last successfully matched node
-            - reserved_dec_block_num: Number of blocks reserved for decoding
+        Build path for a request by caching newly cacheable tokens beyond the common prefix.
 
-            Returns:
-            - leaf_node: The constructed leaf node
+        Parameters
+        ----------
+        req_id : str
+            The unique identifier of the current request.
+        current_time : float
+            Timestamp (e.g., from `time.time()`) used to stamp newly created nodes.
+        input_ids : List[int]
+            Full token sequence for the request (prompt + generated so far). Used to
+            compute `input_hash_value` and stored on nodes for reference.
+        left_input_ids : List[int]
+            The incremental token tail that is newly cacheable beyond the existing
+            prefix represented by `last_node`. May be empty.
+        gpu_block_ids : List[int]
+            A pool of available GPU block IDs. The function consumes from the front (pop(0)) in this order:
+            1. One per newly created full block
+            2. Optionally one for an unfilled tail block
+            3. `reserved_dec_block_num` for future decoding
+            NOTE: The function copies this list internally and consumes the copy.
+
+        block_size : int
+            Token capacity per block node. Only full blocks are materialized as nodes.
+        last_node : BlockNode
+            The last matched node in the tree from which to extend the path.
+        reserved_dec_block_num : int
+            Number of GPU blocks to reserve for future decoding steps.
+
+        Returns
+        -------
+        BlockNode
+            The leaf node after extension. If no new full blocks were added, this may
+            still be `last_node`.
         """
         gpu_block_ids = gpu_block_ids.copy()
-        node = last_node
-        reverved_dec_block_ids = []
-        input_hash_value = self.cal_block_hash(input_ids)
 
+        # If nothing new to cache, only reserve decoding blocks and return
         token_num = len(left_input_ids)
         if token_num == 0:
-            for i in range(reverved_dec_block_num):
-                reverved_dec_block_ids.append(gpu_block_ids.pop(0))
-            last_node.reverved_dec_block_ids.extend(reverved_dec_block_ids)
+            reserved_dec_block_ids = []
+            for i in range(reserved_dec_block_num):
+                reserved_dec_block_ids.append(gpu_block_ids.pop(0))
+            last_node.reserved_dec_block_ids.extend(reserved_dec_block_ids)
             return last_node
-        node = last_node
-        unique_node_ids = []
-        new_last_node = last_node
-        has_unfilled_block = False
 
+        unique_node_ids = []  # track allocated node IDs (for logging/debugging)
+        new_last_node = last_node  # will advance when we add full blocks
+        has_unfilled_block = False  # mark if tail is a partial (non-full) block
+        input_hash_value = self.cal_block_hash(input_ids)
+
+        # Create one BlockNode per FULL block in left_input_ids
         for i in range(0, token_num, block_size):
-            current_block = left_input_ids[i : i + block_size]
-            current_block_size = len(current_block)  # 最后一个block可能没填满
-            if current_block_size != block_size:
+            block_input_ids = left_input_ids[i : i + block_size]
+            if len(block_input_ids) != block_size:  # If (last) block is partial, do NOT create a node
                 has_unfilled_block = True
-            else:
-                hash_value = self.cal_block_hash(current_block)
-                allocated_block_id = gpu_block_ids.pop(0)
+            else:  # For full block, create a new BlockNode
+                block_hash_value = self.cal_block_hash(block_input_ids)
+                block_id = gpu_block_ids.pop(0)  # one GPU block per node
                 node_id = self.node_id_pool.pop()
                 unique_node_ids.append(node_id)
                 new_last_node = BlockNode(
-                    node_id,
-                    input_ids,
-                    input_hash_value,
-                    node.depth + 1,
-                    allocated_block_id,
-                    current_block_size,
-                    hash_value,
-                    current_time,
-                    parent=node,
+                    node_id=node_id,
+                    input_ids=input_ids,
+                    input_hash_value=input_hash_value,
+                    depth=last_node.depth + 1,
+                    block_id=block_id,
+                    token_num=block_input_ids,
+                    hash_value=block_hash_value,
+                    last_used_time=current_time,
+                    parent=last_node,
                     shared_count=1,
-                    reverved_dec_block_ids=[],
+                    reserved_dec_block_ids=[],
                 )
-                new_last_node.req_id_set.add(req_id)
-                self.node_map[node_id] = new_last_node
-                node.children[hash_value] = new_last_node
-                node = new_last_node
-        if has_unfilled_block is True:
-            reverved_dec_block_ids.append(gpu_block_ids.pop(0))
+                new_last_node.req_id_set.add(req_id)  # reference count
+                self.node_map[node_id] = new_last_node  # register in global map
+                last_node.children[block_hash_value] = new_last_node
+                last_node = new_last_node
 
-        for i in range(reverved_dec_block_num):
-            reverved_dec_block_ids.append(gpu_block_ids.pop(0))
-        if new_last_node == self.radix_tree_root:
-            self.unfilled_req_block_map[req_id] = reverved_dec_block_ids
-        else:
-            new_last_node.reverved_dec_block_ids.extend(reverved_dec_block_ids)
+        reserved_dec_block_ids = []
+        # If we ended with a partial block, pre-reserve one GPU block for decoding
+        if has_unfilled_block is True:
+            reserved_dec_block_ids.append(gpu_block_ids.pop(0))
+        # Always reserve additional decoding blocks as requested
+        for i in range(reserved_dec_block_num):
+            reserved_dec_block_ids.append(gpu_block_ids.pop(0))
+
+        # Attach reserved blocks
+        if new_last_node == self.radix_tree_root:  # If no full blocks were added (leaf stayed at root)
+            self.unfilled_req_block_map[req_id] = reserved_dec_block_ids  # stash on root-side map
+        else:  # else attach to the new leaf node
+            new_last_node.reserved_dec_block_ids.extend(reserved_dec_block_ids)
         logger.info(f"build_path: allocate unique node ids {unique_node_ids} for req_id {req_id}")
         return new_last_node
 
