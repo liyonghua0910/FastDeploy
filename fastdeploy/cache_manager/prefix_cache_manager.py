@@ -493,7 +493,27 @@ class PrefixCacheManager:
         match_cpu_block_ids,
     ):
         """
-        将cpu cache转移到GPU
+        Prepare and schedule CPU→GPU cache transfer for matched blocks.
+
+        Parameters
+        ----------
+        req_id : str
+            Unique identifier of the current request.
+        swap_node_ids : list[int]
+            Node IDs that correspond to blocks requiring CPU→GPU transfer.
+        gpu_recv_block_ids : list[int]
+            GPU block IDs allocated to receive data.
+        cpu_recv_block_ids : list[int]
+            Placeholder for future CPU-side receive buffers (unused here).
+        match_cpu_block_ids : list[int]
+            CPU block IDs that hold the cached data to be transferred.
+
+        Notes
+        -----
+        - This function does not perform the transfer itself.
+        It only prepares and issues a swap task via `issue_swap_task`.
+        - The actual memory copy happens asynchronously or
+        in a lower-level executor depending on implementation.
         """
         transfer_task_id = req_id
         need_transfer_task_gpu_block_ids = []
@@ -526,7 +546,32 @@ class PrefixCacheManager:
         match_node_ids,
     ):
         """
-        prepare cache for request
+        Prepare GPU/CPU cache blocks for a request.
+    
+        Parameters
+        ----------
+        req_id : str
+            Unique request identifier.
+        input_ids : list[int]
+            Input token IDs of the request.
+        block_size : int
+            Token count per cache block.
+        expected_block_num : int
+            Total number of GPU blocks the request will need.
+        match_gpu_block_ids : list[int]
+            IDs of blocks already in GPU.
+        match_cpu_block_ids : list[int]
+            IDs of matched blocks currently stored in CPU.
+        match_node_ids : list[int]
+            Node IDs corresponding to matched CPU blocks (used for swap preparation).
+
+        Returns
+        -------
+        gpu_recv_block_ids : list[int]
+            GPU block IDs newly allocated for CPU→GPU transfer.
+        gpu_extra_block_ids : list[int]
+            GPU block IDs newly allocated for uncached input (no prior match).
+    
         """
 
         match_gpu_blocks_num = len(match_gpu_block_ids)
@@ -537,14 +582,16 @@ class PrefixCacheManager:
         gpu_recv_block_ids = []
         gpu_extra_block_ids = []
 
-        # allocate gpu cache for matched cpu blocks
+        # 1) Allocate GPU blocks for matched CPU blocks (to be swapped/moved)
         if match_cpu_blocks_num > 0:
             gpu_recv_block_ids = self.allocate_gpu_blocks(match_cpu_blocks_num)
-        # allocate gpu cache
+        
+        # 2) Allocate extra GPU blocks for new (unmatched) input tokens
         gpu_extra_block_num = expected_block_num - matched_block_num
         if gpu_extra_block_num > 0:
             gpu_extra_block_ids = self.allocate_gpu_blocks(gpu_extra_block_num)
 
+        # 3) If CPU blocks exist, schedule CPU→GPU data transfer
         if len(gpu_recv_block_ids) > 0:
             self._prepare_cpu_cache(
                 req_id,
@@ -631,7 +678,7 @@ class PrefixCacheManager:
 
     def request_match_blocks(self, task, block_size, *args):
         """
-        Attempt to match existing cache blocks for a request and prepare GPU caches.
+        Attempt to match existing cache blocks for a request and prepare GPU caches. (V1 Scheduler)
 
         This synchronous routine tries to match the request's `input_ids` against
         cached blocks (both GPU and CPU). It returns the set of block IDs that are
@@ -866,16 +913,34 @@ class PrefixCacheManager:
 
     def release_block_ids(self, task):
         """
-        release block ids
+        Release all cache blocks and related metadata for a completed request.
+        
+        Parameters
+        ----------
+        task : Task
+            The finished request object containing `request_id` and related metadata.
+
+        Notes
+        -----
+        - Thread-safe: protected by `request_release_lock`.
+        - Prevents memory leaks by ensuring all allocated blocks and references are cleaned up.
+        - Only pushes nodes into LRU heap if they are GPU-resident, non-persistent, and no longer shared.
+
         """
         with self.request_release_lock:
             try:
                 req_id = task.request_id
+                logger.info(f"release_block_ids: start releasing blocks for req_id {req_id} at leaf_node {leaf_node}")
+                
+                # Remove mapping: request → leaf node
                 leaf_node = self.req_leaf_map.pop(req_id)
+                # Remove mapping: leaf node → request
                 if leaf_node in self.leaf_req_map:
                     self.leaf_req_map[leaf_node].remove(req_id)
                     if not (self.leaf_req_map[leaf_node]):
                         del self.leaf_req_map[leaf_node]
+
+                # Walk upward from leaf to root to clean up request references
                 node = leaf_node
                 while node != self.radix_tree_root:
                     if req_id in node.req_id_set:
@@ -883,23 +948,27 @@ class PrefixCacheManager:
                     node.decrement_shared_count()
                     node = node.parent
 
+                # Remove from cache info record
                 if req_id in self.cache_info:
                     del self.cache_info[req_id]
 
-                logger.info(f"release_block_ids: req_id {req_id} leaf_node {leaf_node}")
-
+                # If the request never formed full blocks (still at root), recycle its temporary GPU blocks
                 if leaf_node == self.radix_tree_root:
                     self.recycle_gpu_blocks(self.unfilled_req_block_map[req_id])
                     del self.unfilled_req_block_map[req_id]
                     return
 
+                # If already marked as reusable (in GPU LRU set), skip re-adding
                 if leaf_node in self.gpu_lru_leaf_set:
                     return
+                
+                # Add to LRU set/heap if it's an unused, non-persistent GPU node
                 if leaf_node.shared_count == 0 and leaf_node.is_gpu_leaf_node and leaf_node.is_persistent is False:
                     self.gpu_lru_leaf_set.add(leaf_node)
                     heapq.heappush(self.gpu_lru_leaf_heap, leaf_node)
+                
                 logger.info(
-                    f"release_block_ids: req_id {req_id} has been finished, "
+                    f"release_block_ids: finish releasing blocks for req_id {req_id}, "
                     + f"current gpu_lru_leaf_heap length {len(self.gpu_lru_leaf_heap)}"
                 )
                 return
@@ -1028,20 +1097,42 @@ class PrefixCacheManager:
 
     def free_block_ids_async(self, need_block_num):
         """
-        free block ids async
-        args：
-            need_query_block_num: max number of gpu blocks to free
+        Asynchronously free GPU cache blocks when memory is low.
+
+        Overview
+        --------
+        This function reclaims GPU cache blocks in an asynchronous way.  
+        It pops least-recently-used (LRU) GPU leaf nodes from the heap and either:
+        1. Frees them directly if hierarchical caching is disabled, or
+        2. Marks them as SWAP2CPU and triggers CPU-level cache write-back.
+
+        The actual GPU/CPU freeing is delegated to thread pools
+        (`free_gpu_executor_pool` and `free_cpu_executor_pool`), 
+        so the operation is non-blocking.
+
+        Parameters
+        ----------
+        need_block_num : int
+            The maximum number of GPU blocks to release.
+
+        Notes
+        -----
+        - Protected by `request_release_lock` for thread safety.
+        - Uses a future (`gpu_free_task_future`) to track async freeing progress.
+        - Rebuilds parent nodes into LRU if they become leaf candidates.
+
         """
         with self.request_release_lock:
+            # If a previous free task is still running, skip launching a new one
             if self.gpu_free_task_future is not None:
                 if not self.gpu_free_task_future.done():
                     return
                 else:
                     self.gpu_free_task_future.result()
                     self.gpu_free_task_future = None
+
             try:
                 need_recycle_gpu_block_ids = []
-
                 hash_value_input_ids_map = {}
                 hash_value_block_ids_map = defaultdict(list)
                 hash_value_depth_map = {}
@@ -1050,24 +1141,34 @@ class PrefixCacheManager:
                 hash_value_gpu_block_ids_map = defaultdict(list)
                 total_gpu_free_count = 0
 
+                # Main eviction loop: keep freeing until enough blocks are reclaimed            
                 while True:
                     if len(self.gpu_lru_leaf_heap) == 0:
                         break
                     if total_gpu_free_count >= need_block_num:
                         break
+
+                    # Pop least recently used GPU leaf node
                     node = heapq.heappop(self.gpu_lru_leaf_heap)
                     self.gpu_lru_leaf_set.remove(node)
+                    
+                    # Case 1: hierarchical cache disabled or CPU cache too small
                     if (
                         not self.cache_config.enable_hierarchical_cache
                         or self.cache_config.num_cpu_blocks < need_block_num
                     ):
+                        # Directly free GPU node if not shared and is GPU leaf
                         if node.shared_count == 0 and node.is_gpu_leaf_node:  # 直接回收
                             self._handle_free_gpu_node_without_cpu(node)
                             total_gpu_free_count += 1
+
+                            # Clean up parent if now empty
                             cur_node = node
                             node = node.parent
                             if cur_node.hash_value in node.children:
                                 del node.children[cur_node.hash_value]
+                            
+                            # Reinsert parent into LRU if it becomes a reusable leaf
                             if not node.children:
                                 if node in self.gpu_lru_leaf_set:
                                     continue
@@ -1081,11 +1182,14 @@ class PrefixCacheManager:
                                     self.gpu_lru_leaf_set.add(node)
                         else:
                             continue
+                    # Case 2: hierarchical cache enabled, use SWAP2CPU eviction
                     else:
                         if node.shared_count == 0 and node.is_gpu_leaf_node:
                             node.cache_status = CacheStatus.SWAP2CPU
                         else:
                             continue
+                            
+                        # Handle eviction and bookkeeping for CPU swap-out
                         self._handle_free_gpu_node_with_cpu(
                             node,
                             hash_value_input_ids_map,
@@ -1096,6 +1200,7 @@ class PrefixCacheManager:
                         )
                         total_gpu_free_count += 1
 
+                        # Consider promoting parent into LRU if now reusable
                         node = node.parent
                         if node in self.gpu_lru_leaf_set:
                             continue
@@ -1108,14 +1213,17 @@ class PrefixCacheManager:
                             heapq.heappush(self.gpu_lru_leaf_heap, node)
                             self.gpu_lru_leaf_set.add(node)
 
-                # swap cache to cpu
+                # After collecting eviction info, trigger async background swap/free
                 if hash_value_gpu_block_ids_map:
                     cpu_free_future = None
+                    # Prepare a CPU-side free task if needed
                     if total_gpu_free_count > len(self.cpu_free_block_list):
                         cpu_free_count = total_gpu_free_count
                         if cpu_free_count < need_block_num:
                             cpu_free_count = need_block_num
+                        # Submit async CPU free operation
                         cpu_free_future = self.free_cpu_executor_pool.submit(self.free_cpu_block_ids, cpu_free_count)
+                    # Submit async GPU eviction + swap-to-CPU job
                     self.gpu_free_task_future = self.free_gpu_executor_pool.submit(
                         self._evict_cache_async,
                         cpu_free_future,
@@ -1127,6 +1235,7 @@ class PrefixCacheManager:
                         hash_value_depth_map,
                     )
                 else:
+                    # No swap-to-CPU operations → nothing to free asynchronously
                     self.gpu_free_task_future = None
             except Exception as e:
                 logger.error(f"free_block_ids_async: error: {type(e)} {e}, {str(traceback.format_exc())}")
@@ -1191,22 +1300,35 @@ class PrefixCacheManager:
 
     def match_block(self, req_id, input_ids, block_size):
         """
-        Args:
-            req_id: Task request ID
-            input_ids: Input token IDs
-            block_size: Size of each block
+        Try to match existing cached blocks (in GPU/CPU) for given input sequence.
 
-        Returns:
-            match_gpu_block_ids: List of matched GPU block IDs
-            match_cpu_block_ids: List of matched CPU block IDs
-            swap_node_ids: List of node IDs requiring swap operations
-            match_block_node: Last matched node in the path
-            gpu_match_token_num: Number of tokens matched in GPU blocks
-            cpu_match_token_num: Number of tokens matched in CPU blocks
+        Parameters
+        ----------
+        req_id: str
+            Task request ID
+        input_ids: list
+            Input token IDs
+        block_size: int
+            Size of each block
+
+        Returns
+        -------
+        match_gpu_block_ids : list
+            IDs of matched blocks that are already in GPU.
+        match_cpu_block_ids : list
+            IDs of matched blocks currently only in CPU.
+        swap_node_ids : list
+            Node IDs that require CPU→GPU swap operations.
+        match_block_node : BlockNode
+            The last successfully matched node in the radix tree.
+        gpu_match_token_num : int
+            Number of tokens matched in GPU blocks.
+        cpu_match_token_num : int
+            Number of tokens matched in CPU blocks.
         """
 
         total_token_num = len(input_ids)
-        current_match_node = self.radix_tree_root  # 从根节点开始搜
+        current_match_node = self.radix_tree_root  # start from the root node
         match_gpu_block_ids = []
         match_cpu_block_ids = []
         match_node_ids = []
@@ -1214,21 +1336,23 @@ class PrefixCacheManager:
         cpu_match_token_num = 0
         gpu_match_token_num = 0
         swap_node_ids = []
-        matche_nodes = []
         has_modified_gpu_lru_leaf_heap = False
         has_modified_cpu_lru_leaf_heap = False
 
         with self.cache_status_lock:
+            # iterate blocks one by one until no more matches
             while match_token_num < total_token_num:
                 token_block = input_ids[match_token_num : match_token_num + block_size]
                 token_num = len(token_block)
                 if token_num != block_size:
-                    break
+                    break  # skip incomplete (tail) block
+
                 hash_value = self.cal_block_hash(token_block)
                 if hash_value in current_match_node.children:
                     child = current_match_node.children[hash_value]
-                    matche_nodes.append(child)
                     match_node_ids.append(child.node_id)
+                
+                    # Remove from LRU tracking (recently used, so should not be evicted)
                     if child in self.gpu_lru_leaf_set:
                         self.gpu_lru_leaf_set.remove(child)
                         self.gpu_lru_leaf_heap.remove(child)
@@ -1237,11 +1361,14 @@ class PrefixCacheManager:
                         self.cpu_lru_leaf_set.remove(child)
                         self.cpu_lru_leaf_heap.remove(child)
                         has_modified_cpu_lru_leaf_heap = True
+
                     if child.has_in_gpu:
                         match_gpu_block_ids.append(child.block_id)
                         gpu_match_token_num += block_size
                     else:
                         if child.cache_status == CacheStatus.SWAP2CPU:
+                            # If matched node is being swapped to CPU; 
+                            # cancel the swap task by treating it as GPU available again
                             logger.info(
                                 f"match_block: req_id {req_id} matched node"
                                 + f" {child.node_id} which is being SWAP2CPU"
