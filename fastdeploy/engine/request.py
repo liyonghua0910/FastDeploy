@@ -70,6 +70,8 @@ class Request:
         pooling_params: Optional[PoolingParams] = None,
         preprocess_start_time: Optional[float] = None,
         preprocess_end_time: Optional[float] = None,
+        inference_start_time: float = 0,
+        llm_engine_recv_req_timestamp: float = 0,
         multimodal_inputs: Optional[dict] = None,
         multimodal_data: Optional[dict] = None,
         disable_chat_template: bool = False,
@@ -95,8 +97,6 @@ class Request:
         prefill_start_index: int = 0,
         prefill_end_index: int = 0,
         num_computed_tokens: int = 0,
-        inference_start_time: float = 0,
-        llm_engine_recv_req_timestamp: float = 0,
     ) -> None:
         self.request_id = request_id
         self.prompt = prompt
@@ -115,6 +115,10 @@ class Request:
         self.arrival_time = arrival_time
         self.preprocess_start_time = preprocess_start_time
         self.preprocess_end_time = preprocess_end_time
+        self.inference_start_time = inference_start_time
+        self.llm_engine_recv_req_timestamp = (
+            llm_engine_recv_req_timestamp if llm_engine_recv_req_timestamp else time.time()
+        )
         self.disable_chat_template = disable_chat_template
         self.disaggregate_info = disaggregate_info
 
@@ -163,7 +167,6 @@ class Request:
         self.extend_block_tables = []
         # dp
         self.dp_rank = dp_rank
-        self.llm_engine_recv_req_timestamp = time.time()
 
     @classmethod
     def from_dict(cls, d: dict):
