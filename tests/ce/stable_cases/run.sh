@@ -251,7 +251,7 @@ for round in $(seq 1 $V0_ROUNDS); do
     run_v0_round "$round"
 done
 
-for round in $(seq 1 $V1_ROUNDS); do
+for round in $(seq "$((V0_ROUNDS + 1))" "$((V0_ROUNDS + V1_ROUNDS))"); do
     run_v1_round "$round"
 done
 
